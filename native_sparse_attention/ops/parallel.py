@@ -7,7 +7,6 @@ from typing import Optional, Union
 import torch
 import triton
 import triton.language as tl
-import triton.language.core as core
 from einops import rearrange
 
 from fla.ops.common.utils import (prepare_chunk_indices, prepare_chunk_offsets,
@@ -31,9 +30,8 @@ except ImportError:
 })
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4, 5]
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1, 2, 4]
     ],
     key=['BS', 'BK', 'BV'],
 )
@@ -134,9 +132,8 @@ def parallel_nsa_compression_fwd_kernel(
 })
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4, 5]
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1, 2, 4]
     ],
     key=['BS', 'BK', 'BV'],
 )
@@ -238,7 +235,7 @@ def parallel_nsa_compression_bwd_kernel_dq(
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8]
+        for num_warps in [1, 2, 4]
     ],
     key=['BS', 'BK', 'BV'],
 )
@@ -334,9 +331,8 @@ def parallel_nsa_compression_bwd_kernel_dkv(
 })
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4, 5]
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1, 2, 4]
     ],
     key=['BS', 'BK'],
 )
@@ -443,8 +439,8 @@ def parallel_nsa_kernel_topk(
         b_i, b_ip = tl.sum(b_p, 0), b_i
         o_i, o_ip = tl.where(o_c <= i_t // BS, o_c + 1, 0), o_i
 
-        n_dims: core.constexpr = tl.standard._log2(b_i.shape[0])
-        for i in core.static_range(1, n_dims):
+        n_dims: tl.constexpr = tl.standard._log2(b_i.shape[0])
+        for i in tl.static_range(1, n_dims):
             b_i, o_i = _bitonic_merge(b_i, o_i.to(tl.int32), i, 2, n_dims)
 
         if i_c != 0:
@@ -469,7 +465,7 @@ def parallel_nsa_kernel_topk(
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8]
+        for num_warps in [1, 2, 4]
     ],
     key=['BS', 'BK', 'BV'],
 )
@@ -613,9 +609,8 @@ def parallel_nsa_bwd_kernel_preprocess(
 })
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4, 5]
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1, 2, 4]
     ],
     key=['BS', 'BK', 'BV'],
 )
@@ -721,9 +716,8 @@ def parallel_nsa_bwd_kernel_dq(
 })
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4, 5]
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in [1, 2, 4]
     ],
     key=['BS', 'BK', 'BV'],
 )
