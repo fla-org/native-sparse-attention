@@ -138,93 +138,112 @@ def parallel_nsa_compression_fwd_kernel(
 )
 @triton.jit(do_not_specialize=['T'])
 def parallel_nsa_compression_bwd_kernel_dq(
-    q,
-    k,
-    v,
-    lse,
-    delta,
-    do,
-    dq,
-    scale,
-    offsets,
-    token_indices,
+    # 输入参数
+    q,  # Query矩阵
+    k,  # Key矩阵
+    v,  # Value矩阵
+    lse,  # Log Sum Exp结果
+    delta,  # softmax导数修正项
+    do,  # 输出o的梯度
+    dq,  # Query梯度(输出)
+    scale,  # 缩放因子
+    offsets,  # 序列偏移量
+    token_indices,  # token索引
     chunk_offsets,
-    T,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    HQ: tl.constexpr,
-    G: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BC: tl.constexpr,
-    BS: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    USE_OFFSETS: tl.constexpr
+    T,  # 序列长度
+    # 常量参数
+    B: tl.constexpr,  # 块大小
+    H: tl.constexpr,  # 注意力头数
+    HQ: tl.constexpr,  # 每个头的维度
+    G: tl.constexpr,  # 组数
+    K: tl.constexpr,  # Key维度
+    V: tl.constexpr,  # Value维度
+    BC: tl.constexpr,  # 压缩块大小
+    BS: tl.constexpr,  # 序列块大小
+    BK: tl.constexpr,  # Key块大小
+    BV: tl.constexpr,  # Value块大小
+    USE_OFFSETS: tl.constexpr,  # 是否使用偏移量的标志
 ):
+    # 获取程序ID，用于并行计算
     i_t, i_v, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_b, i_h = i_bh // H, i_bh % H
+    i_b, i_h = i_bh // H, i_bh % H  # 计算批次和头索引
 
+    # 根据是否使用偏移量设置序列范围
     if USE_OFFSETS:
+        # 加载token信息和偏移量
         i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(token_indices + i_t * 2 + 1).to(tl.int32)
         bos, eos = tl.load(offsets + i_n).to(tl.int32), tl.load(offsets + i_n + 1).to(tl.int32)
-        T = eos - bos
+        T = eos - bos  # 计算实际序列长度
         boc = tl.load(chunk_offsets + i_n).to(tl.int32)
     else:
+        # 使用固定长度
         bos, eos = i_b * T, i_b * T + T
         boc = i_b * tl.cdiv(T, BS)
 
+    # 调整所有指针的基地址
     q += (bos + i_t) * HQ*K
     do += (bos + i_t) * HQ*V
     lse += (bos + i_t) * HQ
     delta += (bos + i_t) * HQ
     dq += (i_v * B * T + bos + i_t) * HQ*K
 
+    # 创建Query和其梯度的块指针
     p_q = tl.make_block_ptr(q, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0))
     p_dq = tl.make_block_ptr(dq, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0))
 
-    # [G, BK]
-    b_q = tl.load(p_q, boundary_check=(0, 1))
+    # 加载并缩放Query块
+    b_q = tl.load(p_q, boundary_check=(0, 1))  # [G, BK]
     b_q = (b_q * scale).to(b_q.dtype)
 
+    # 创建输出梯度的块指针
     p_do = tl.make_block_ptr(do, (HQ, V), (V, 1), (i_h * G, i_v * BV), (G, BV), (1, 0))
+    # 创建lse和delta的指针
     p_lse = lse + i_h * G + tl.arange(0, G)
     p_delta = delta + i_h * G + tl.arange(0, G)
 
+    # 计算压缩表示相关参数
     # the number of compression representations in total
-    TC = tl.cdiv(T, BS)
+    TC = tl.cdiv(T, BS)  # 总压缩块数
     # the number of compression representations required to iterate over
     # incomplete compression blocks are not included
-    NC = (i_t + 1) // BS
+    NC = (i_t + 1) // BS  # 需要处理的压缩块数
 
-    # [G, BV]
-    b_do = tl.load(p_do, boundary_check=(0, 1))
-    # [G]
-    b_lse = tl.load(p_lse)
-    b_delta = tl.load(p_delta)
+    # 加载必要的数据
+    b_do = tl.load(p_do, boundary_check=(0, 1))  # [G, BV]输出梯度
+    b_lse = tl.load(p_lse)  # [G] log-sum-exp值
+    b_delta = tl.load(p_delta)  # [G] delta值
 
-    # [G, BK]
-    b_dq = tl.zeros([G, BK], dtype=tl.float32)
+    # 初始化Query梯度
+    b_dq = tl.zeros([G, BK], dtype=tl.float32)  # [G, BK]
+    
+    # 主循环：处理所有压缩块
     for i_c in range(0, NC, BC):
         o_c = i_c + tl.arange(0, BC)
+        
+        # 创建Key和Value的块指针
         p_k = tl.make_block_ptr(k + (boc * H + i_h) * K, (K, TC), (1, H*K), (0, i_c), (BK, BC), (0, 1))
         p_v = tl.make_block_ptr(v + (boc * H + i_h) * V, (V, TC), (1, H*V), (i_v * BV, i_c), (BV, BC), (0, 1))
-        # [BK, BC]
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        # [BV, BC]
-        b_v = tl.load(p_v, boundary_check=(0, 1))
+        # 加载Key和Value块
+        b_k = tl.load(p_k, boundary_check=(0, 1))  # [BK, BC]
+        b_v = tl.load(p_v, boundary_check=(0, 1))  # [BV, BC]
 
-        # [G, BC]
-        b_s = tl.dot(b_q, b_k)
-        b_p = tl.exp(b_s - b_lse[:, None])
-        b_p = tl.where((o_c < NC)[None, :], b_p, 0)
+        # 计算attention scores和probabilities
+        b_s = tl.dot(b_q, b_k)  # [G, BC] = [G, BK] @ [BK, BC]
+        b_p = tl.exp(b_s - b_lse[:, None])  # 计算softmax概率
+        b_p = tl.where((o_c < NC)[None, :], b_p, 0)  # 处理边界情况
 
-        # [G, BV] @ [BV, BC] -> [G, BC]
-        b_dp = tl.dot(b_do, b_v)
-        b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
-        # [G, BC] @ [BC, BK] -> [G, BK]
+        # 计算梯度
+        b_dp = tl.dot(b_do, b_v)  # [G, BV] @ [BV, BC] -> [G, BC]
+        # 计算attention score的梯度：p * (dp - delta)
+        b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])  # [G, BC]
+        
+        # 计算Query的梯度
+        # dQ = dS @ K.T
         b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
+        
+    # 最终处理：应用scale因子
     b_dq *= scale
+    # 存储Query梯度结果
     tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -326,90 +345,102 @@ def parallel_nsa_compression_bwd_kernel_dkv(
 
 
 @triton.heuristics({
-    'USE_OFFSETS': lambda args: args['offsets'] is not None
+    'USE_OFFSETS': lambda args: args['offsets'] is not None # 根据是否提供offsets参数来决定使用模式
 })
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps)
-        for num_warps in [1, 2, 4]
+        for num_warps in [1, 2, 4]  # 自动调优不同的warp数配置
     ],
-    key=['BS', 'BK'],
+    key=["BS", "BK"],  # 以块大小作为调优key
 )
 @triton.jit
 def parallel_nsa_kernel_topk(
-    q,
-    k,
-    lse,
-    scale,
-    block_indices,
-    offsets,
-    token_indices,
+    # 输入参数
+    q,  # Query矩阵
+    k,  # Key矩阵
+    lse,  # Log Sum Exp值(可选)
+    scale,  # 缩放因子
+    block_indices,  # 输出的块索引
+    offsets,  # 序列偏移量(可选)
+    token_indices,  # token索引
     chunk_offsets,
-    T,
-    H: tl.constexpr,
-    HQ: tl.constexpr,
-    G: tl.constexpr,
-    K: tl.constexpr,
-    S: tl.constexpr,
-    BC: tl.constexpr,
-    BS: tl.constexpr,
-    BK: tl.constexpr,
-    USE_OFFSETS: tl.constexpr,
+    T,  # 序列长度
+    # 常量参数
+    H: tl.constexpr,  # 注意力头数
+    HQ: tl.constexpr,  # 每个头的维度
+    G: tl.constexpr,  # 组数
+    K: tl.constexpr,  # Key维度
+    S: tl.constexpr,  # 要选择的Top块数
+    BC: tl.constexpr,  # 压缩块大小
+    BS: tl.constexpr,  # 序列块大小
+    BK: tl.constexpr,  # Key块大小
+    USE_OFFSETS: tl.constexpr,  # 是否使用偏移量
 ):
+    # 获取并行维度索引
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
-    i_b, i_h = i_bh // H, i_bh % H
+    i_b, i_h = i_bh // H, i_bh % H  # 计算批次和头索引
 
+    # 处理序列范围
     if USE_OFFSETS:
+        # 使用偏移量时，计算实际序列范围
         i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(token_indices + i_t * 2 + 1).to(tl.int32)
         bos, eos = tl.load(offsets + i_n).to(tl.int32), tl.load(offsets + i_n + 1).to(tl.int32)
         T = eos - bos
         boc = tl.load(chunk_offsets + i_n).to(tl.int32)
     else:
+        # 使用固定长度
         bos, eos = i_b * T, i_b * T + T
         boc = i_b * tl.cdiv(T, BS)
 
+    # 创建并加载Query块
     p_q = tl.make_block_ptr(q + (bos + i_t) * HQ*K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0))
 
     # the Q block is kept in the shared memory throughout the whole kernel
-    # [G, BK]
-    b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_q = (b_q * scale).to(b_q.dtype)
+    b_q = tl.load(p_q, boundary_check=(0, 1))  # [G, BK]
+    b_q = (b_q * scale).to(b_q.dtype)  # 应用scale
 
+    # 计算压缩相关参数
     # the number of compression representations in total
-    TC = tl.cdiv(T, BS)
+    TC = tl.cdiv(T, BS)  # 总压缩块数
     # the number of compression representations required to iterate over
     # incomplete compression blocks are not included
-    NC = (i_t + 1) // BS
+    NC = (i_t + 1) // BS  # 需要处理的压缩块数
     ################################
     # 1. lse computation
     ################################
     if lse is not None:
+        # 如果提供了LSE，直接加载
         b_lse = tl.load(lse + (bos + i_t) * HQ + i_h * G + tl.arange(0, G))
     else:
+        # 如果没有提供LSE，需要计算
+        # 初始化最大值和累积值
         # max scores for the current block
         b_m = tl.full([G], float('-inf'), dtype=tl.float32)
         # lse = log(acc) + m
         b_acc = tl.zeros([G], dtype=tl.float32)
+        
+        # 使用online softmax算法计算LSE
         for i_c in range(0, NC, BC):
-            o_c = i_c + tl.arange(0, BC)
+            o_c = i_c + tl.arange(0, BC)  # 生成偏移量
 
+            # 加载Key块
             p_k = tl.make_block_ptr(k + (boc * H + i_h) * K, (K, TC), (1, H*K), (0, i_c), (BK, BC), (0, 1))
-            # [BK, BC]
-            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_k = tl.load(p_k, boundary_check=(0, 1))  # [BK, BC]
 
-            # [G, BC]
-            b_s = tl.dot(b_q, b_k)
-            b_s = tl.where((o_c < NC)[None, :], b_s, float('-inf'))
+            # 计算attention scores
+            b_s = tl.dot(b_q, b_k)  # [G, BC] = [G, BK] @ [BK, BC]
+            b_s = tl.where((o_c < NC)[None, :], b_s, float('-inf'))  # 处理边界情况
 
-            # [G]
-            b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
-            b_r = tl.exp(b_mp - b_m)
-            # [G, BC]
-            b_p = tl.exp(b_s - b_m[:, None])
-            # [G]
-            b_acc = b_acc * b_r + tl.sum(b_p, 1)
+            # 更新最大值和累积和
+            b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m  # 更新最大值[G]
+            b_r = tl.exp(b_mp - b_m)  # 计算重缩放因子
+            b_p = tl.exp(b_s - b_m[:, None])  # 计算softmax概率[G, BC]
+            b_acc = b_acc * b_r + tl.sum(b_p, 1)  # 更新累积和[G]
 
             b_mp = b_m
+            
+        # 计算最终的LSE值
         if NC == 0:
             b_lse = tl.zeros([G], dtype=tl.float32)
         else:
@@ -418,139 +449,174 @@ def parallel_nsa_kernel_topk(
     ################################
     # 2. topk selection
     ################################
-    # [BC]
-    b_i = tl.full([BC], -1, dtype=tl.float32)
-    o_i = tl.zeros([BC], dtype=tl.int32)
-    m_i = tl.arange(0, BC) < BC//2
+    # 初始化数组用于TopK选择
+    b_i = tl.full([BC], -1, dtype=tl.float32)  # 存储重要性分数[BC]
+    o_i = tl.zeros([BC], dtype=tl.int32)  # 存储对应索引
+    m_i = tl.arange(0, BC) < BC//2  # TopK mask
+    
+    # 遍历所有块计算重要性分数
     for i_c in range(0, i_t // BS + 1, BC):
         o_c = i_c + tl.arange(0, BC)
 
+        # 加载Key块
         p_k = tl.make_block_ptr(k + (boc * H + i_h) * K, (K, TC), (1, H*K), (0, i_c), (BK, BC), (0, 1))
-        # [BK, BC]
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        # [G, BC]
-        b_s = tl.dot(b_q, b_k)
+        b_k = tl.load(p_k, boundary_check=(0, 1))  # [BK, BC]
+        # 计算attention scores和概率
+        b_s = tl.dot(b_q, b_k)  # [G, BC]
+        # 对超出范围的块设置为负无穷
         b_s = tl.where((i_t // BS > o_c)[None, :], b_s, float('-inf'))
-        # [G, BC]
-        b_p = tl.where((i_t // BS == o_c)[None, :], float(1.0), tl.exp(b_s - b_lse[:, None]))
+        # 计算attention概率
+        # 对于当前块使用1.0，其他块使用exp(score - lse)
+        b_p = tl.where((i_t // BS == o_c)[None, :], float(1.0), tl.exp(b_s - b_lse[:, None]))  # [G, BC]
+        
+        # 计算每个块的重要性分数（所有头的概率和）
         # the importance scores of the current block
-        # [BC]
-        b_i, b_ip = tl.sum(b_p, 0), b_i
+        b_i, b_ip = tl.sum(b_p, 0), b_i  # [BC], 保存旧值
+        # 更新索引，确保在有效范围内
         o_i, o_ip = tl.where(o_c <= i_t // BS, o_c + 1, 0), o_i
 
+        # 使用双调排序进行TopK选择
+        # 计算需要的排序轮数
         n_dims: tl.constexpr = tl.standard._log2(b_i.shape[0])
+        
+        # 第一阶段排序
         for i in tl.static_range(1, n_dims):
             b_i, o_i = _bitonic_merge(b_i, o_i.to(tl.int32), i, 2, n_dims)
 
-        if i_c != 0:
+        # 第二阶段排序：合并新旧结果
+        if i_c != 0:  # 如果不是第一个块，需要与之前的结果合并
             b_i, o_i = _bitonic_merge(b_i, o_i.to(tl.int32), n_dims, False, n_dims)
+            # 使用mask选择保留的值
             b_i_new = b_ip * m_i + b_i * (1 - m_i)
             o_i_new = o_ip * m_i + o_i * (1 - m_i)
+            # 最终排序
             b_i, o_i = _bitonic_merge(b_i_new, o_i_new.to(tl.int32), n_dims, True, n_dims)
         else:
+            # 第一个块直接排序
             b_i, o_i = _bitonic_merge(b_i, o_i.to(tl.int32), n_dims, True, n_dims)
 
-    m_top = tl.arange(0, BC//S) == 0
+    # 提取TopK结果
+    m_top = tl.arange(0, BC//S) == 0  # 用于选择前S个结果的mask
+    # 重塑并选择最终的TopK索引
     b_top = tl.sum(m_top[:, None] * tl.reshape(o_i - 1, [BC//S, S]), 0)
 
+    # 存储TopK结果
     p_b = tl.make_block_ptr(block_indices + (bos + i_t) * H*S, (H*S,), (1,), (i_h * S,), (S,), (0,))
     tl.store(p_b, b_top.to(p_b.dtype.element_ty))
 
 
 @triton.heuristics({
-    'USE_OFFSETS': lambda args: args['offsets'] is not None,
-    'USE_BLOCK_COUNTS': lambda args: isinstance(args['block_counts'], torch.Tensor),
+    "USE_OFFSETS": lambda args: args["offsets"] is not None,  # 是否使用序列偏移量
+    "USE_BLOCK_COUNTS": lambda args: isinstance(args["block_counts"], torch.Tensor), # 是否使用可变块数
 })
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps)
-        for num_warps in [1, 2, 4]
+        for num_warps in [1, 2, 4]  # 自动调优不同的warp数配置
     ],
-    key=['BS', 'BK', 'BV'],
+    key=["BS", "BK", "BV"],  # 以块大小作为调优key
 )
 @triton.jit
 def parallel_nsa_fwd_kernel(
-    q,
-    k,
-    v,
+    # 输入参数
+    q,  # Query矩阵
+    k,  # Key矩阵
+    v,  # Value矩阵
     o,
     lse,
-    scale,
-    block_indices,
-    block_counts,
-    offsets,
-    token_indices,
-    T,
-    H: tl.constexpr,
-    HQ: tl.constexpr,
-    G: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    S: tl.constexpr,
-    BS: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    USE_OFFSETS: tl.constexpr,
-    USE_BLOCK_COUNTS: tl.constexpr
+    scale,  # 缩放因子
+    block_indices,  # 选择性注意力的块索引
+    block_counts,  # 每个位置的块数量(可选)
+    offsets,  # 序列偏移量(可选)
+    token_indices,  # token索引
+    T,  # 序列长度
+    # 常量参数
+    H: tl.constexpr,  # 注意力头数
+    HQ: tl.constexpr,  # 每个头的维度
+    G: tl.constexpr,  # Group Size
+    K: tl.constexpr,  # Key维度
+    V: tl.constexpr,  # Value维度
+    S: tl.constexpr,  # 选择的块数
+    BS: tl.constexpr,  # 序列块大小
+    BK: tl.constexpr,  # Key块大小
+    BV: tl.constexpr,  # Value块大小
+    USE_OFFSETS: tl.constexpr,  # 是否使用偏移量
+    USE_BLOCK_COUNTS: tl.constexpr,  # 是否使用块数量
 ):
+    # 获取并行维度索引
     i_t, i_v, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_b, i_h = i_bh // H, i_bh % H
+    i_b, i_h = i_bh // H, i_bh % H  # 计算批次和头索引
 
+    # 处理序列范围
     if USE_OFFSETS:
+        # 使用偏移量时，计算实际序列范围
         i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(token_indices + i_t * 2 + 1).to(tl.int32)
         bos, eos = tl.load(offsets + i_n).to(tl.int32), tl.load(offsets + i_n + 1).to(tl.int32)
         T = eos - bos
     else:
+        # 使用固定长度
         bos, eos = i_b * T, i_b * T + T
 
+    # 调整指针基地址
     k += (bos * H + i_h) * K
     v += (bos * H + i_h) * V
     block_indices += (bos + i_t) * H*S + i_h * S
 
+    # 确定要处理的块数
     if USE_BLOCK_COUNTS:
         NS = tl.load(block_counts + (bos + i_t) * H + i_h)
     else:
         NS = S
 
+    # 创建并加载Query块
     p_q = tl.make_block_ptr(q + (bos + i_t) * HQ*K, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0))
     # the Q block is kept in the shared memory throughout the whole kernel
     # [G, BK]
-    b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_q = (b_q * scale).to(b_q.dtype)
+    b_q = tl.load(p_q, boundary_check=(0, 1))  # [G, BK]
+    b_q = (b_q * scale).to(b_q.dtype)  # 应用scale因子
 
+    # 创建选择性注意力(SLC)的输出指针
     p_o = tl.make_block_ptr(o + (bos + i_t) * HQ*V, (HQ, V), (V, 1), (i_h * G, i_v * BV), (G, BV), (1, 0))
     p_lse = lse + (bos + i_t) * HQ + i_h * G + tl.arange(0, G)
-    # [G, BV]
-    b_o = tl.zeros([G, BV], dtype=tl.float32)
+    # 初始化选择性注意力的输出缓冲区
+    b_o = tl.zeros([G, BV], dtype=tl.float32)  # [G, BV],输出累积
 
-    b_m = tl.full([G], float('-inf'), dtype=tl.float32)
-    b_acc = tl.zeros([G], dtype=tl.float32)
+    b_m = tl.full([G], float('-inf'), dtype=tl.float32)  # 最大值追踪
+    b_acc = tl.zeros([G], dtype=tl.float32)  # softmax累积
+    
+    # 选择性注意力计算：遍历所有选定的块
     for i in range(NS):
+        # 加载块索引并计算起始位置
         i_s = tl.load(block_indices + i).to(tl.int32) * BS
-        if i_s <= i_t and i_s >= 0:
+        if i_s <= i_t and i_s >= 0:  # 检查块是否有效
+            # 创建Key和Value的块指针
             p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (0, i_s), (BK, BS), (0, 1))
             p_v = tl.make_block_ptr(v, (T, V), (H*V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
-            # [BK, BS]
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            # [BS, BV]
-            b_v = tl.load(p_v, boundary_check=(0, 1))
-            # [G, BS]
-            b_s = tl.dot(b_q, b_k)
+            # 加载Key和Value块
+            b_k = tl.load(p_k, boundary_check=(0, 1))  # [BK, BS]
+            b_v = tl.load(p_v, boundary_check=(0, 1))  # [BS, BV]
+            
+            # 计算注意力分数
+            b_s = tl.dot(b_q, b_k)  # [G, BS]
+            # 处理casual mask：确保只看到当前位置之前的token
             b_s = tl.where((i_t >= (i_s + tl.arange(0, BS)))[None, :], b_s, float('-inf'))
 
-            # [G]
-            b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m
-            b_r = tl.exp(b_mp - b_m)
-            # [G, BS]
-            b_p = tl.exp(b_s - b_m[:, None])
-            # [G]
-            b_acc = b_acc * b_r + tl.sum(b_p, 1)
-            # [G, BV]
-            b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)
+            # online softmax计算
+            b_m, b_mp = tl.maximum(b_m, tl.max(b_s, 1)), b_m  # [G],更新最大值
+            b_r = tl.exp(b_mp - b_m)  # 计算重缩放因子
+            # 计算attention权重
+            b_p = tl.exp(b_s - b_m[:, None])  # [G, BS]
+            # 更新softmax累积和
+            b_acc = b_acc * b_r + tl.sum(b_p, 1)  # [G]
+            # 更新输出累积
+            b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)  # [G, BV]
 
-            b_mp = b_m
-    b_o = b_o / b_acc[:, None]
-    b_m += tl.log(b_acc)
+            b_mp = b_m  # 保存当前最大值供下次迭代使用
+    
+    # 选择性注意力的最终处理
+    b_o = b_o / b_acc[:, None]  # 归一化输出
+    b_m += tl.log(b_acc)  # 计算最终的LSE值
+    # 存储选择性注意力的结果
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_lse, b_m.to(p_lse.dtype.element_ty))
 
@@ -815,12 +881,12 @@ def parallel_nsa_compression_fwd(
     H = k.shape[2]
     G = HQ // H
     BC = BS = block_size
-    if torch.cuda.get_device_capability()[0] >= 9:
-        BK = min(256, triton.next_power_of_2(K))
-        BV = min(256, triton.next_power_of_2(V))
-    else:
-        BK = min(128, triton.next_power_of_2(K))
-        BV = min(128, triton.next_power_of_2(V))
+    # if torch.cuda.get_device_capability()[0] >= 9:
+    #     BK = min(256, triton.next_power_of_2(K))
+    #     BV = min(256, triton.next_power_of_2(V))
+    # else:
+    BK = min(128, triton.next_power_of_2(K))
+    BV = min(128, triton.next_power_of_2(V))
     NK = triton.cdiv(K, BK)
     NV = triton.cdiv(V, BV)
     assert NK == 1, "The key dimension can not be larger than 256"
