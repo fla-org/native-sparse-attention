@@ -162,7 +162,7 @@ def parallel_nsa_compression_bwd_kernel_dq(
     BS: tl.constexpr,  # 序列块大小
     BK: tl.constexpr,  # Key块大小
     BV: tl.constexpr,  # Value块大小
-    USE_OFFSETS: tl.constexpr,  # 是否使用偏移量的标志
+    USE_OFFSETS: tl.constexpr  # 是否使用偏移量的标志
 ):
     # 获取程序ID，用于并行计算
     i_t, i_v, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -881,12 +881,12 @@ def parallel_nsa_compression_fwd(
     H = k.shape[2]
     G = HQ // H
     BC = BS = block_size
-    # if torch.cuda.get_device_capability()[0] >= 9:
-    #     BK = min(256, triton.next_power_of_2(K))
-    #     BV = min(256, triton.next_power_of_2(V))
-    # else:
-    BK = min(128, triton.next_power_of_2(K))
-    BV = min(128, triton.next_power_of_2(V))
+    BKV_VALUE=256
+    if torch.cuda.is_available():
+        if torch.cuda.get_device_capability()[0] < 9:
+            BKV_VALUE=128
+    BK = min(BKV_VALUE, triton.next_power_of_2(K))
+    BV = min(BKV_VALUE, triton.next_power_of_2(V))
     NK = triton.cdiv(K, BK)
     NV = triton.cdiv(V, BV)
     assert NK == 1, "The key dimension can not be larger than 256"
@@ -1130,12 +1130,12 @@ def parallel_nsa_fwd(
     HQ = q.shape[2]
     G = HQ // H
     BS = block_size
-    if torch.cuda.get_device_capability()[0] >= 9:
-        BK = min(256, triton.next_power_of_2(K))
-        BV = min(256, triton.next_power_of_2(V))
-    else:
-        BK = min(128, triton.next_power_of_2(K))
-        BV = min(128, triton.next_power_of_2(V))
+    BKV_VALUE=256
+    if torch.cuda.is_available():
+        if torch.cuda.get_device_capability()[0] < 9:
+            BKV_VALUE=128
+    BK = min(BKV_VALUE, triton.next_power_of_2(K))
+    BV = min(BKV_VALUE, triton.next_power_of_2(V))
     NK = triton.cdiv(K, BK)
     NV = triton.cdiv(V, BV)
     assert NK == 1, "The key dimension can not be larger than 256"
