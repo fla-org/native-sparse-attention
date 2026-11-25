@@ -9,7 +9,10 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
-from fla.ops.common.utils import prepare_chunk_indices, prepare_chunk_offsets, prepare_lens, prepare_token_indices
+try:
+    from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets, prepare_lens, prepare_token_indices
+except (ImportError, ModuleNotFoundError):
+    from fla.ops.common.utils import prepare_chunk_indices, prepare_chunk_offsets, prepare_lens, prepare_token_indices
 from fla.ops.utils import mean_pooling
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, contiguous
 from native_sparse_attention.ops.utils import _bitonic_merge
@@ -1320,9 +1323,9 @@ def parallel_nsa(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g_cmp: torch.Tensor,
     g_slc: torch.Tensor,
     g_swa: torch.Tensor,
+    g_cmp: Optional[torch.Tensor] = None,
     block_indices: Optional[torch.LongTensor] = None,
     block_counts: Union[torch.LongTensor, int] = 16,
     block_size: int = 64,
