@@ -6,7 +6,10 @@ import pytest
 import torch
 import triton
 
-from fla.ops.common.utils import prepare_token_indices
+try:
+    from fla.ops.utils import prepare_token_indices
+except (ImportError, ModuleNotFoundError):
+    from fla.ops.common.utils import prepare_token_indices
 from native_sparse_attention.ops.naive import naive_nsa
 from native_sparse_attention.ops.parallel import parallel_nsa
 

@@ -28,7 +28,10 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 import native_sparse_attention  # noqa
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
-from fla.ops.common.utils import prepare_position_ids
+try:
+    from fla.ops.utils import prepare_position_ids
+except (ImportError, ModuleNotFoundError):
+    from fla.ops.common.utils import prepare_position_ids
 from flame.components.checkpoint import TrainState
 from flame.config_manager import JobConfig
 from flame.data import build_dataloader, shuffle
